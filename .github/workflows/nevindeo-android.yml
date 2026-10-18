@@ -1,0 +1,140 @@
+name: Nevindeo Android (arm64)
+
+# The first-delivery build for Nevindeo: one APK, arm64-v8a only, no iOS, no
+# desktop bundles and no emulator smoke. It uses the same steps and the same
+# pinned actions as the `android` job in mobile.yml (which still builds both
+# ABIs, runs the emulator smoke tests and iOS); only the scope is smaller.
+#
+# Run it by hand from the Actions tab ("Run workflow"). The APK is signed
+# with a throw-away key made for the run, so it installs as any sideloaded
+# app does; no secret is read here. Sign a distribution build over again
+# with your own key (see mobile.yml's "Sign with the repository's key").
+#
+# Output: the artifact "Nevindeo-android-arm64", holding
+# Nevindeo-<version>-android-arm64.apk.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: nevindeo-android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  GGML_NATIVE: "OFF"
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Android arm64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      TARGET: aarch64-linux-android
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read the version
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' src/Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building Nevindeo $version for $TARGET"
+      - name: The pinned toolchain
+        id: toolchain
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' src/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (v1), 2026-10-09
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: aarch64-linux-android
+      - uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2.3.1
+        with:
+          tool: cargo-apk
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
+
+      - name: FFmpeg for Android (cached)
+        id: ffmpeg
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: src/vendor/ffmpeg/aarch64-linux-android
+          key: ffmpeg-aarch64-linux-android-${{ hashFiles('src/scripts/ffmpeg-mobile.sh') }}
+      - name: FFmpeg for Android
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        run: src/scripts/ffmpeg-mobile.sh aarch64-linux-android
+      - name: FFmpeg for Android (save)
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: src/vendor/ffmpeg/aarch64-linux-android
+          key: ${{ steps.ffmpeg.outputs.cache-primary-key }}
+
+      - name: sherpa-onnx for Android
+        run: src/scripts/sherpa-mobile.sh aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src
+          key: aarch64-linux-android
+
+      # A throw-away key for this run only: nothing worth keeping, and no
+      # secret involved.
+      - name: A key for the run
+        run: |
+          set -euo pipefail
+          keystore=$RUNNER_TEMP/run.keystore
+          pass=$(openssl rand -hex 16)
+          echo "::add-mask::$pass"
+          keytool -genkeypair -v -keystore "$keystore" -storepass "$pass" -keypass "$pass" \
+            -alias nevindeo -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Nevindeo, O=Nevindeo" >/dev/null 2>&1
+          echo "CARGO_APK_RELEASE_KEYSTORE=$keystore" >> "$GITHUB_ENV"
+          echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=$pass" >> "$GITHUB_ENV"
+
+      - name: Build the APK
+        working-directory: src
+        run: |
+          set -o pipefail
+          eval "$(scripts/mobile-env.sh $TARGET)"
+          cargo apk build --release -p concat-android --target $TARGET 2>&1 | tee build.log
+
+      - name: Build log to the summary (failure only)
+        if: failure()
+        run: |
+          if [ -f src/build.log ]; then
+            {
+              echo "### Build failed: Nevindeo Android arm64"
+              echo '```'
+              tail -n 150 src/build.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # The APK is checked, not assumed: it has to exist, hold the arm64
+      # library, and carry the Nevindeo label.
+      - name: Verify the APK
+        run: |
+          set -euo pipefail
+          apk=src/target/release/apk/Nevindeo.apk
+          test -s "$apk"
+          unzip -l "$apk" | grep -q 'lib/arm64-v8a/'
+          sdk=${ANDROID_HOME:-$ANDROID_SDK_ROOT}
+          tools=$(find "$sdk/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
+          "$tools/aapt2" dump badging "$apk" | grep -E "^application-label:'Nevindeo'" 
+          "$tools/apksigner" verify --print-certs "$apk"
+
+      - name: Stage
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir stage
+          cp src/target/release/apk/Nevindeo.apk "stage/Nevindeo-$VERSION-android-arm64.apk"
+          ls -l stage
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Nevindeo-android-arm64
+          path: stage/*
+          if-no-files-found: error
